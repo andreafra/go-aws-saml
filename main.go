@@ -1,20 +1,24 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
 	"github.com/xlzd/gotp"
 	"gopkg.in/yaml.v2"
-	"log"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
 type Credentials struct {
@@ -22,23 +26,52 @@ type Credentials struct {
 	Password string `yaml:"password"`
 	TOTP     string `yaml:"totp"`
 
-	Accounts []Accounts `yaml:"accounts"`
+	Accounts []Account `yaml:"accounts"`
 }
 
-type Accounts struct {
-	Name          string `yaml:"name"`
+type Account struct {
+	Label         string `yaml:"label"`
 	IAMRole       string `yaml:"iam-role"`
 	SAMLProvider  string `yaml:"saml-provider"`
 	Env           string `yaml:"env"`
 	AccountNumber string `yaml:"account"`
 }
 
+type RoleWithAccount struct {
+	Account *Account
+	Role    *sts.AssumeRoleWithSAMLOutput
+}
+
 const AUnicaAWSSamlURL = "https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=2299"
 const AWSLoginSAMLPageURL = "https://signin.aws.amazon.com/saml"
-const SAMLResponsePrefix = "SAMLResponse="
+const AWSCredentialsFile = ".aws/credentials"
+
+type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
 func main() {
+	credentials := readCredentialsFile()
+	samlResponseChan := make(chan string, 1)
 
+	authenticateWithBrowser(credentials, samlResponseChan)
+
+	// Block unless we have a response
+	samlResponse := <-samlResponseChan
+
+	rolesWithAccount := make([]*RoleWithAccount, 0, len(credentials.Accounts))
+
+	for _, account := range credentials.Accounts {
+		role := assumeRole(account, samlResponse)
+
+		rolesWithAccount = append(rolesWithAccount, &RoleWithAccount{
+			Account: &account,
+			Role:    role,
+		})
+	}
+
+	writeRolesToAWSCredentialsFile(rolesWithAccount)
+}
+
+func readCredentialsFile() Credentials {
 	userHomeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal(err)
@@ -57,6 +90,12 @@ func main() {
 		log.Fatal(err)
 	}
 
+	return credentials
+}
+
+func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) {
+
+	// Setup TOTP
 	totp := gotp.NewDefaultTOTP(credentials.TOTP)
 
 	// Chrome DP
@@ -69,7 +108,7 @@ func main() {
 	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	resp, err := chromedp.RunResponse(ctx,
+	_, err := chromedp.RunResponse(ctx,
 		chromedp.Navigate(AUnicaAWSSamlURL),
 		// wait for page load
 		chromedp.WaitVisible(`.ingressoPolimi`),
@@ -81,8 +120,7 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("Username & Password validated")
-	log.Println(resp)
-	resp, err = chromedp.RunResponse(ctx,
+	_, err = chromedp.RunResponse(ctx,
 		chromedp.WaitVisible(`#otp`),
 		chromedp.SetAttributeValue(`#otp`, `value`, totp.Now()),
 		chromedp.Click(`#submit-dissms`),
@@ -91,14 +129,12 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("TOTP validated")
-	log.Println(resp)
 
 	listenCtx, listenCancel := context.WithTimeout(ctx, 10*time.Second)
 
-	samlResponseChan := make(chan string, 1)
-
 	// Listen for requests
-	chromedp.ListenTarget(listenCtx, func(ev interface{}) {
+	log.Println("Listening for SAML POST Requests...")
+	chromedp.ListenTarget(listenCtx, func(ev any) {
 		switch ev := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			req := ev.Request
@@ -106,41 +142,103 @@ func main() {
 			if req.Method == "POST" && strings.HasPrefix(req.URL, AWSLoginSAMLPageURL) {
 				listenCancel()
 
-				samlResponseBase64 := req.PostDataEntries[0].Bytes
+				requestBody := req.PostDataEntries[0].Bytes
 
-				samlResponse, err := base64.StdEncoding.DecodeString(samlResponseBase64)
+				decodedRequestBody, err := base64.StdEncoding.DecodeString(string(requestBody))
 				if err != nil {
-					log.Fatal(err)
+					log.Fatalf("Failed to decode request body: %v", err)
 				}
-				samlResponseStr := string(samlResponse)
-				log.Printf("SAML Response: %s", samlResponseStr)
-				if strings.HasPrefix(samlResponseStr, SAMLResponsePrefix) {
-					samlResponseChan <- strings.TrimPrefix(SAMLResponsePrefix, samlResponseStr)
+
+				parsedBody, err := url.ParseQuery(string(decodedRequestBody))
+				if err != nil {
+					log.Fatalf("Failed to parse request body: %v", err)
 				}
+
+				samlResponseBase64 := parsedBody.Get("SAMLResponse")
+				if samlResponseBase64 == "" {
+					log.Fatal("SAMLResponse is empty")
+				}
+
+				samlResponseChan <- samlResponseBase64
 			}
 		}
 	})
+}
 
-	// Block unless we have a response
-	samlResponse := <-samlResponseChan
+func assumeRole(account Account, samlResponse string) *sts.AssumeRoleWithSAMLOutput {
+	ctx := context.Background()
 
-	println("Assuming role using AWS CLI")
-	for _, account := range credentials.Accounts {
-		assumeRoleCmdInput := fmt.Sprintf(`aws sts assume-role-with-saml
-            --role-arn arn:aws:iam::%s:role/%s
-            --principal-arn arn:aws:iam::%s:saml-provider/%s
-            --saml-assertion "%s"`, account.AccountNumber, account.IAMRole, account.AccountNumber, account.SAMLProvider, samlResponse)
-
-		cmd := exec.Command(assumeRoleCmdInput)
-
-		var outb, errb bytes.Buffer
-		cmd.Stdout = &outb
-		cmd.Stderr = &errb
-
-		if err := cmd.Run(); err != nil {
-			log.Println(err)
-		}
-		fmt.Println("out:", outb.String(), "err:", errb.String())
+	config, err := awsconfig.LoadDefaultConfig(ctx)
+	if err != nil {
+		log.Fatalf("Failed to load AWS configuration: %v", err)
 	}
 
+	if config.Region == "" {
+		log.Fatal(
+			`Please make sure to set an AWS region in your AWS CLI configuration.`,
+			`You can set the region using the following command:
+
+			aws configure set region <region>
+
+			`,
+			`For example:
+
+			aws configure set region us-east-1
+
+			`)
+	}
+
+	sts := sts.NewFromConfig(config)
+
+	assumeRoleInput := &AssumeRoleWithSAMLInput{
+		RoleArn:       aws.String(fmt.Sprintf("arn:aws:iam::%s:role/%s", account.AccountNumber, account.IAMRole)),
+		PrincipalArn:  aws.String(fmt.Sprintf("arn:aws:iam::%s:saml-provider/%s", account.AccountNumber, account.SAMLProvider)),
+		SAMLAssertion: aws.String(samlResponse),
+	}
+
+	assumeRoleOutput, err := sts.AssumeRoleWithSAML(ctx, assumeRoleInput)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return assumeRoleOutput
+}
+
+func writeRolesToAWSCredentialsFile(roles []*RoleWithAccount) {
+	userHomeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal(err)
+	}
+	credentialsFilePath := filepath.Join(userHomeDir, AWSCredentialsFile)
+
+	// Create backup file
+	previousData, err := os.ReadFile(credentialsFilePath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	const perm = 0600
+
+	os.WriteFile(credentialsFilePath+".bak", previousData, perm)
+
+	os.WriteFile(credentialsFilePath, nil, perm)
+	fileD, err := os.OpenFile(credentialsFilePath, os.O_APPEND, perm)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer fileD.Close()
+
+	for i, roleWithAccount := range roles {
+		role := roleWithAccount.Role
+		account := roleWithAccount.Account
+		if i > 0 {
+			fmt.Fprintf(fileD, "\n\n")
+		}
+		fmt.Fprintf(fileD, "\n[profile %s]\n", account.Label)
+		fmt.Fprintf(fileD, "aws_access_key_id = %s\n", *role.Credentials.AccessKeyId)
+		fmt.Fprintf(fileD, "aws_secret_access_key = %s\n", *role.Credentials.SecretAccessKey)
+		fmt.Fprintf(fileD, "aws_session_token = %s\n", *role.Credentials.SessionToken)
+	}
+
+	log.Println("AWS credentials file updated successfully.")
 }
