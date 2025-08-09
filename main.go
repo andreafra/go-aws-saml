@@ -44,7 +44,6 @@ type RoleWithAccount struct {
 
 const AUnicaAWSSamlURL = "https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=2299"
 const AWSLoginSAMLPageURL = "https://signin.aws.amazon.com/saml"
-const AWSCredentialsFile = ".aws/credentials"
 
 type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
@@ -52,7 +51,7 @@ func main() {
 	credentials := readCredentialsFile()
 	samlResponseChan := make(chan string, 1)
 
-	authenticateWithBrowser(credentials, samlResponseChan)
+	go authenticateWithBrowser(credentials, samlResponseChan)
 
 	// Block unless we have a response
 	samlResponse := <-samlResponseChan
@@ -93,7 +92,7 @@ func readCredentialsFile() Credentials {
 	return credentials
 }
 
-func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) {
+func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) context.CancelFunc {
 
 	// Setup TOTP
 	totp := gotp.NewDefaultTOTP(credentials.TOTP)
@@ -105,8 +104,41 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 	)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
+	ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
+
+	listenCtx, listenCancel := context.WithTimeout(ctx, 10*time.Second)
+
+	// Listen for requests
+	log.Println("Listening for SAML POST Requests...")
+	chromedp.ListenTarget(listenCtx, func(ev any) {
+		switch ev := ev.(type) {
+		case *network.EventRequestWillBeSent:
+			req := ev.Request
+			// log.Printf("%s - %s - %v", req.Method, req.URL, req.PostDataEntries)
+			if req.Method == "POST" && strings.HasPrefix(req.URL, AWSLoginSAMLPageURL) {
+				log.Print("Decoding SAML Response")
+				requestBody := req.PostDataEntries[0].Bytes
+
+				decodedRequestBody, err := base64.StdEncoding.DecodeString(string(requestBody))
+				if err != nil {
+					log.Fatalf("Failed to decode request body: %v", err)
+				}
+
+				parsedBody, err := url.ParseQuery(string(decodedRequestBody))
+				if err != nil {
+					log.Fatalf("Failed to parse request body: %v", err)
+				}
+
+				samlResponseBase64 := parsedBody.Get("SAMLResponse")
+				if samlResponseBase64 == "" {
+					log.Fatal("SAMLResponse is empty")
+				}
+
+				samlResponseChan <- samlResponseBase64
+			}
+		}
+	})
 
 	_, err := chromedp.RunResponse(ctx,
 		chromedp.Navigate(AUnicaAWSSamlURL),
@@ -129,40 +161,15 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 		log.Fatal(err)
 	}
 	log.Println("TOTP validated")
+	_, err = chromedp.RunResponse(ctx,
+		chromedp.WaitVisible(`#container`),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Println("SAML Page reached")
 
-	listenCtx, listenCancel := context.WithTimeout(ctx, 10*time.Second)
-
-	// Listen for requests
-	log.Println("Listening for SAML POST Requests...")
-	chromedp.ListenTarget(listenCtx, func(ev any) {
-		switch ev := ev.(type) {
-		case *network.EventRequestWillBeSent:
-			req := ev.Request
-			log.Printf("%s - %s - %v", req.Method, req.URL, req.PostDataEntries)
-			if req.Method == "POST" && strings.HasPrefix(req.URL, AWSLoginSAMLPageURL) {
-				listenCancel()
-
-				requestBody := req.PostDataEntries[0].Bytes
-
-				decodedRequestBody, err := base64.StdEncoding.DecodeString(string(requestBody))
-				if err != nil {
-					log.Fatalf("Failed to decode request body: %v", err)
-				}
-
-				parsedBody, err := url.ParseQuery(string(decodedRequestBody))
-				if err != nil {
-					log.Fatalf("Failed to parse request body: %v", err)
-				}
-
-				samlResponseBase64 := parsedBody.Get("SAMLResponse")
-				if samlResponseBase64 == "" {
-					log.Fatal("SAMLResponse is empty")
-				}
-
-				samlResponseChan <- samlResponseBase64
-			}
-		}
-	})
+	return listenCancel
 }
 
 func assumeRole(account Account, samlResponse string) *sts.AssumeRoleWithSAMLOutput {
@@ -209,22 +216,39 @@ func writeRolesToAWSCredentialsFile(roles []*RoleWithAccount) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	credentialsFilePath := filepath.Join(userHomeDir, AWSCredentialsFile)
 
-	// Create backup file
-	previousData, err := os.ReadFile(credentialsFilePath)
-	if err != nil {
-		log.Fatal(err)
+	awsDir := filepath.Join(userHomeDir, ".aws")
+	credentialsFilePath := filepath.Join(awsDir, "credentials")
+
+	// Ensure .aws directory exists
+	if _, err := os.Stat(awsDir); os.IsNotExist(err) {
+		err = os.Mkdir(awsDir, 0700) // Create with permissions only for owner
+		if err != nil {
+			log.Fatalf("Failed to create .aws directory: %v", err)
+		}
 	}
 
-	const perm = 0600
+	// Check if credentials file exists to create a backup
+	if _, err := os.Stat(credentialsFilePath); err == nil {
+		// File exists, create backup
+		previousData, err := os.ReadFile(credentialsFilePath)
+		if err != nil {
+			log.Fatalf("Failed to read existing AWS credentials file for backup: %v", err)
+		}
+		err = os.WriteFile(credentialsFilePath+".bak", previousData, 0600)
+		if err != nil {
+			log.Fatalf("Failed to write AWS credentials backup file: %v", err)
+		}
+	} else if !os.IsNotExist(err) {
+		// Some other error occurred when checking file existence
+		log.Fatalf("Failed to check AWS credentials file existence: %v", err)
+	}
 
-	os.WriteFile(credentialsFilePath+".bak", previousData, perm)
-
-	os.WriteFile(credentialsFilePath, nil, perm)
-	fileD, err := os.OpenFile(credentialsFilePath, os.O_APPEND, perm)
+	// Open the file for writing, create if not exists, truncate if exists
+	fileD, err := os.OpenFile(credentialsFilePath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
 	if err != nil {
 		log.Fatal(err)
+		log.Fatalf("Failed to open AWS credentials file for writing: %v", err)
 	}
 	defer fileD.Close()
 
@@ -234,7 +258,7 @@ func writeRolesToAWSCredentialsFile(roles []*RoleWithAccount) {
 		if i > 0 {
 			fmt.Fprintf(fileD, "\n\n")
 		}
-		fmt.Fprintf(fileD, "\n[profile %s]\n", account.Label)
+		fmt.Fprintf(fileD, "[%s]\n", account.Label)
 		fmt.Fprintf(fileD, "aws_access_key_id = %s\n", *role.Credentials.AccessKeyId)
 		fmt.Fprintf(fileD, "aws_secret_access_key = %s\n", *role.Credentials.SecretAccessKey)
 		fmt.Fprintf(fileD, "aws_session_token = %s\n", *role.Credentials.SessionToken)
