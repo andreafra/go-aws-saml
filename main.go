@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"flag"
 	"fmt"
 	"log"
 	"net/url"
@@ -48,6 +49,20 @@ const AWSLoginSAMLPageURL = "https://signin.aws.amazon.com/saml"
 type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
 func main() {
+
+	refreshInterval := flag.Int("refresh_interval_minutes", 59, "Interval in minutes to refresh credentials")
+
+	refreshTicker := time.NewTicker(time.Duration(*refreshInterval) * time.Minute)
+
+	refreshCredentialsWithSAML(*refreshInterval)
+
+	for range refreshTicker.C {
+		refreshCredentialsWithSAML(*refreshInterval)
+	}
+}
+
+func refreshCredentialsWithSAML(nextRefreshInterval int) {
+	log.Print("Refreshing credentials...")
 	credentials := readCredentialsFile()
 	samlResponseChan := make(chan string, 1)
 
@@ -68,6 +83,8 @@ func main() {
 	}
 
 	writeRolesToAWSCredentialsFile(rolesWithAccount)
+
+	log.Printf("Next refresh in %d minutes", nextRefreshInterval)
 }
 
 func readCredentialsFile() Credentials {
@@ -92,7 +109,7 @@ func readCredentialsFile() Credentials {
 	return credentials
 }
 
-func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) context.CancelFunc {
+func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) {
 
 	// Setup TOTP
 	totp := gotp.NewDefaultTOTP(credentials.TOTP)
@@ -104,10 +121,11 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 	)
 	defer cancel()
 
-	ctx, cancel = context.WithTimeout(ctx, 60*time.Second)
+	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	listenCtx, listenCancel := context.WithTimeout(ctx, 10*time.Second)
+	listenCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
 
 	// Listen for requests
 	log.Println("Listening for SAML POST Requests...")
@@ -168,8 +186,6 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 		log.Fatal(err)
 	}
 	log.Println("SAML Page reached")
-
-	return listenCancel
 }
 
 func assumeRole(account Account, samlResponse string) *sts.AssumeRoleWithSAMLOutput {
@@ -262,6 +278,10 @@ func writeRolesToAWSCredentialsFile(roles []*RoleWithAccount) {
 		fmt.Fprintf(fileD, "aws_access_key_id = %s\n", *role.Credentials.AccessKeyId)
 		fmt.Fprintf(fileD, "aws_secret_access_key = %s\n", *role.Credentials.SecretAccessKey)
 		fmt.Fprintf(fileD, "aws_session_token = %s\n", *role.Credentials.SessionToken)
+
+		log.Printf(" * Add profile for '%s' (env=%s) [%s - %s]", account.Label, account.Env, account.AccountNumber, account.IAMRole)
+
+		log.Printf("   expiring in %v", time.Until(*role.Credentials.Expiration))
 	}
 
 	log.Println("AWS credentials file updated successfully.")
