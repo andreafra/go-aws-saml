@@ -50,14 +50,18 @@ type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
 func main() {
 
-	refreshInterval := flag.Int("refresh-interval-minutes", 59, "Interval in minutes to refresh credentials")
+	var refreshInterval int
+	flag.IntVar(&refreshInterval, "refresh-interval-minutes", 59, "Interval in minutes to refresh credentials")
+	flag.IntVar(&refreshInterval, "i", 59, "Interval in minutes to refresh credentials (shorthand)")
 
-	refreshTicker := time.NewTicker(time.Duration(*refreshInterval) * time.Minute)
+	flag.Parse()
 
-	refreshCredentialsWithSAML(*refreshInterval)
+	refreshTicker := time.NewTicker(time.Duration(refreshInterval) * time.Minute)
+
+	refreshCredentialsWithSAML(refreshInterval)
 
 	for range refreshTicker.C {
-		refreshCredentialsWithSAML(*refreshInterval)
+		refreshCredentialsWithSAML(refreshInterval)
 	}
 }
 
