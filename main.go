@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/base64"
-	"flag"
 	"fmt"
 	"log"
 	"net/url"
@@ -22,12 +21,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 )
 
+type Config struct {
+	Credentials     Credentials `yaml:"credentials"`
+	Accounts        []Account   `yaml:"accounts"`
+	Browser         Browser     `yaml:"browser"`
+	RefreshInterval int         `yaml:"refresh-in-seconds"`
+}
+
 type Credentials struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
 	TOTP     string `yaml:"totp"`
-
-	Accounts []Account `yaml:"accounts"`
 }
 
 type Account struct {
@@ -38,49 +42,62 @@ type Account struct {
 	AccountNumber string `yaml:"account"`
 }
 
+type Browser struct {
+	StartingURL string `yaml:"starting-url"`
+	Login       Login  `yaml:"login"`
+	TOTP        TOTP   `yaml:"totp"`
+}
+
+type Login struct {
+	WaitForSelector  string `yaml:"wait-for-selector"`
+	UsernameSelector string `yaml:"username-selector"`
+	PasswordSelector string `yaml:"password-selector"`
+	SubmitSelector   string `yaml:"submit-selector"`
+}
+type TOTP struct {
+	WaitForSelector string `yaml:"wait-for-selector"`
+	TOTPSelector    string `yaml:"totp-selector"`
+	SubmitSelector  string `yaml:"submit-selector"`
+}
+
 type RoleWithAccount struct {
 	Account *Account
 	Role    *sts.AssumeRoleWithSAMLOutput
 }
 
-const AUnicaAWSSamlURL = "https://aunicalogin.polimi.it/aunicalogin/getservizio.xml?id_servizio=2299"
 const AWSLoginSAMLPageURL = "https://signin.aws.amazon.com/saml"
+
+const timeout = 30 // seconds
 
 type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
 func main() {
+	config := readConfigFile()
+	refreshTicker := time.NewTicker(time.Duration(config.RefreshInterval) * time.Second)
 
-	var refreshInterval int
-	flag.IntVar(&refreshInterval, "refresh-interval-minutes", 59, "Interval in minutes to refresh credentials")
-	flag.IntVar(&refreshInterval, "i", 59, "Interval in minutes to refresh credentials (shorthand)")
-
-	flag.Parse()
-
-	refreshTicker := time.NewTicker(time.Duration(refreshInterval) * time.Minute)
-
-	refreshCredentialsWithSAML(refreshInterval)
+	refreshCredentialsWithSAML(config)
 
 	for range refreshTicker.C {
-		refreshCredentialsWithSAML(refreshInterval)
+		refreshCredentialsWithSAML(config)
 	}
 }
 
-func refreshCredentialsWithSAML(nextRefreshInterval int) {
+func refreshCredentialsWithSAML(config Config) {
 	log.Print("Refreshing credentials...")
-	credentials := readCredentialsFile()
+
 	samlResponseChan := make(chan string, 1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), timeout*time.Second)
 	defer cancel()
 
-	go authenticateWithBrowser(ctx, credentials, samlResponseChan)
+	go authenticateWithBrowser(ctx, config, samlResponseChan)
 
 	// Block unless we have a response
 	samlResponse := <-samlResponseChan
 
-	rolesWithAccount := make([]*RoleWithAccount, 0, len(credentials.Accounts))
+	rolesWithAccount := make([]*RoleWithAccount, 0, len(config.Accounts))
 
-	for _, account := range credentials.Accounts {
+	for _, account := range config.Accounts {
 		role := assumeRole(account, samlResponse)
 
 		rolesWithAccount = append(rolesWithAccount, &RoleWithAccount{
@@ -91,10 +108,10 @@ func refreshCredentialsWithSAML(nextRefreshInterval int) {
 
 	writeRolesToAWSCredentialsFile(rolesWithAccount)
 
-	log.Printf("Next refresh in %d minutes", nextRefreshInterval)
+	log.Printf("Next refresh in %v", time.Duration(config.RefreshInterval)*time.Second)
 }
 
-func readCredentialsFile() Credentials {
+func readConfigFile() Config {
 	userHomeDir, err := os.UserHomeDir()
 	if err != nil {
 		log.Fatal(err)
@@ -106,32 +123,44 @@ func readCredentialsFile() Credentials {
 		log.Fatal(err)
 	}
 
-	var credentials Credentials
+	var config Config
 
-	err = yaml.Unmarshal(credentialsFile, &credentials)
+	err = yaml.Unmarshal(credentialsFile, &config)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	return credentials
+	return config
 }
 
-func authenticateWithBrowser(ctx context.Context, credentials Credentials, samlResponseChan chan<- string) {
+func authenticateWithBrowser(ctx context.Context, config Config, samlResponseChan chan<- string) {
 
 	// Setup TOTP
-	totp := gotp.NewDefaultTOTP(credentials.TOTP)
+	totp := gotp.NewDefaultTOTP(config.Credentials.TOTP)
+
+	// Create an allocator with the headless flag set to false.
+	// You must append this to the default options.
+	opts := append(
+		chromedp.DefaultExecAllocatorOptions[:],
+		chromedp.Flag("headless", true), // turn off for debugging
+	)
+
+	// Create a new context from the modified allocator options.
+	// This ensures the new browser instance uses your specified options.
+	allocCtx, cancel := chromedp.NewExecAllocator(ctx, opts...)
+	defer cancel()
 
 	// Chrome DP
 	chromedpCtx, cancelChromedpCtx := chromedp.NewContext(
-		ctx,
-		//chromedp.WithDebugf(log.Printf),
+		allocCtx,
+		// chromedp.WithDebugf(log.Printf),
 	)
 	defer cancelChromedpCtx()
 
-	actionCtx, cancelActionCtx := context.WithTimeout(chromedpCtx, 10*time.Second)
+	actionCtx, cancelActionCtx := context.WithTimeout(chromedpCtx, timeout*time.Second)
 	defer cancelActionCtx()
 
-	listenCtx, cancelListenCtx := context.WithTimeout(actionCtx, 10*time.Second)
+	listenCtx, cancelListenCtx := context.WithTimeout(actionCtx, timeout*time.Second)
 	defer cancelListenCtx()
 
 	// Listen for requests
@@ -165,27 +194,22 @@ func authenticateWithBrowser(ctx context.Context, credentials Credentials, samlR
 		}
 	})
 
-	_, err := chromedp.RunResponse(actionCtx,
-		chromedp.Navigate(AUnicaAWSSamlURL),
+	err := chromedp.Run(actionCtx,
+		chromedp.Navigate(config.Browser.StartingURL),
 		// wait for page load
-		chromedp.WaitVisible(`.ingressoPolimi`),
-		chromedp.SetAttributeValue(`#login`, `value`, credentials.Username),
-		chromedp.SetAttributeValue(`#password`, `value`, credentials.Password),
-		chromedp.Click(`.aunicalogin-button-accedi > button`),
+		chromedp.WaitVisible(config.Browser.Login.WaitForSelector),
+		chromedp.SendKeys(config.Browser.Login.UsernameSelector, config.Credentials.Username),
+		chromedp.SendKeys(config.Browser.Login.PasswordSelector, config.Credentials.Password),
+		chromedp.Click(config.Browser.Login.SubmitSelector),
+		// totp
+		chromedp.WaitVisible(config.Browser.TOTP.TOTPSelector),
+		chromedp.SendKeys(config.Browser.TOTP.TOTPSelector, totp.Now()),
+		chromedp.Click(config.Browser.TOTP.SubmitSelector),
 	)
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Println("Username & Password validated")
-	_, err = chromedp.RunResponse(actionCtx,
-		chromedp.WaitVisible(`#otp`),
-		chromedp.SetAttributeValue(`#otp`, `value`, totp.Now()),
-		chromedp.Click(`#submit-dissms`),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("TOTP validated")
+	log.Println("Login successful")
 	time.Sleep(5 * time.Second)
 }
 
@@ -286,4 +310,6 @@ func writeRolesToAWSCredentialsFile(roles []*RoleWithAccount) {
 	}
 
 	log.Println("AWS credentials file updated successfully.")
+
+	log.Println("Select your profile using `export AWS_PROFILE=<profile name>`")
 }
