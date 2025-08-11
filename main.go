@@ -50,7 +50,7 @@ type AssumeRoleWithSAMLInput = sts.AssumeRoleWithSAMLInput
 
 func main() {
 
-	refreshInterval := flag.Int("refresh_interval_minutes", 59, "Interval in minutes to refresh credentials")
+	refreshInterval := flag.Int("refresh-interval-minutes", 59, "Interval in minutes to refresh credentials")
 
 	refreshTicker := time.NewTicker(time.Duration(*refreshInterval) * time.Minute)
 
@@ -66,7 +66,10 @@ func refreshCredentialsWithSAML(nextRefreshInterval int) {
 	credentials := readCredentialsFile()
 	samlResponseChan := make(chan string, 1)
 
-	go authenticateWithBrowser(credentials, samlResponseChan)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	go authenticateWithBrowser(ctx, credentials, samlResponseChan)
 
 	// Block unless we have a response
 	samlResponse := <-samlResponseChan
@@ -109,23 +112,23 @@ func readCredentialsFile() Credentials {
 	return credentials
 }
 
-func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- string) {
+func authenticateWithBrowser(ctx context.Context, credentials Credentials, samlResponseChan chan<- string) {
 
 	// Setup TOTP
 	totp := gotp.NewDefaultTOTP(credentials.TOTP)
 
 	// Chrome DP
-	ctx, cancel := chromedp.NewContext(
-		context.Background(),
+	chromedpCtx, cancelChromedpCtx := chromedp.NewContext(
+		ctx,
 		//chromedp.WithDebugf(log.Printf),
 	)
-	defer cancel()
+	defer cancelChromedpCtx()
 
-	ctx, cancel = context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
+	actionCtx, cancelActionCtx := context.WithTimeout(chromedpCtx, 10*time.Second)
+	defer cancelActionCtx()
 
-	listenCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
+	listenCtx, cancelListenCtx := context.WithTimeout(actionCtx, 10*time.Second)
+	defer cancelListenCtx()
 
 	// Listen for requests
 	log.Println("Listening for SAML POST Requests...")
@@ -158,7 +161,7 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 		}
 	})
 
-	_, err := chromedp.RunResponse(ctx,
+	_, err := chromedp.RunResponse(actionCtx,
 		chromedp.Navigate(AUnicaAWSSamlURL),
 		// wait for page load
 		chromedp.WaitVisible(`.ingressoPolimi`),
@@ -170,7 +173,7 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 		log.Fatal(err)
 	}
 	log.Println("Username & Password validated")
-	_, err = chromedp.RunResponse(ctx,
+	_, err = chromedp.RunResponse(actionCtx,
 		chromedp.WaitVisible(`#otp`),
 		chromedp.SetAttributeValue(`#otp`, `value`, totp.Now()),
 		chromedp.Click(`#submit-dissms`),
@@ -179,13 +182,7 @@ func authenticateWithBrowser(credentials Credentials, samlResponseChan chan<- st
 		log.Fatal(err)
 	}
 	log.Println("TOTP validated")
-	_, err = chromedp.RunResponse(ctx,
-		chromedp.WaitVisible(`#container`),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
-	log.Println("SAML Page reached")
+	time.Sleep(5 * time.Second)
 }
 
 func assumeRole(account Account, samlResponse string) *sts.AssumeRoleWithSAMLOutput {
