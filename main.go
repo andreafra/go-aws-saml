@@ -17,6 +17,8 @@ var (
 	assumeRolesFn                    = assumeRoles
 	writeRolesToAWSCredentialsFileFn = writeRolesToAWSCredentialsFile
 	startBackgroundProcessFn         = startBackgroundProcess
+	reattachBackgroundSessionFn      = reattachBackgroundSession
+	runManagedBackgroundSessionFn    = runManagedBackgroundSession
 	signSelectedTenantURLFn          = signSelectedTenantURL
 	buildIAMAuthTokenFn              = buildIAMAuthToken
 )
@@ -84,7 +86,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	setRuntimeDebugLogging(config.Browser.Debug)
 
 	if *backgroundRun {
-		return runRefreshLoop(stdin, stdout, configPath, &config, false, false)
+		return runManagedBackgroundSessionFn(stdin, stdout, configPath, &config)
+	}
+
+	if attached, err := reattachBackgroundSessionFn(stdout); err != nil {
+		return err
+	} else if attached {
+		return nil
 	}
 
 	return runRefreshLoop(stdin, stdout, configPath, &config, true, true)
@@ -95,10 +103,13 @@ func runRefreshLoop(stdin io.Reader, stdout io.Writer, configPath string, config
 	defer refreshTicker.Stop()
 
 	if initialRefresh {
+		backgroundSessionLogf("running initial refresh")
 		backgroundRequested, quitRequested, err := refreshCredentialsWithSAML(stdin, stdout, configPath, config, promptForDefault)
 		if err != nil {
+			backgroundSessionLogf("initial refresh failed: %v", err)
 			return err
 		}
+		backgroundSessionLogf("initial refresh completed")
 		if quitRequested {
 			return nil
 		}
@@ -112,10 +123,13 @@ func runRefreshLoop(stdin io.Reader, stdout io.Writer, configPath string, config
 	}
 
 	for range refreshTicker.C {
+		backgroundSessionLogf("running scheduled refresh")
 		backgroundRequested, quitRequested, err := refreshCredentialsWithSAML(stdin, stdout, configPath, config, false)
 		if err != nil {
+			backgroundSessionLogf("scheduled refresh failed: %v", err)
 			return err
 		}
+		backgroundSessionLogf("scheduled refresh completed")
 		if quitRequested {
 			return nil
 		}

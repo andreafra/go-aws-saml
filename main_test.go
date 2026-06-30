@@ -280,6 +280,70 @@ func TestRunSignURLWritesSignedURL(t *testing.T) {
 	}
 }
 
+func TestRunReattachesToExistingBackgroundSession(t *testing.T) {
+	restore := stubMainDependencies()
+	defer restore()
+
+	loadConfigFileFn = func(path string, stdin io.Reader, stdout io.Writer) (Config, error) {
+		return Config{
+			Region:          "eu-west-1",
+			RefreshInterval: 3500,
+			Credentials:     CredentialsConfig{DefaultProfile: "prod"},
+			Accounts:        []Account{{Label: "prod"}},
+		}, nil
+	}
+
+	reattachBackgroundSessionFn = func(stdout io.Writer) (bool, error) {
+		_, _ = io.WriteString(stdout, "attached\n")
+		return true, nil
+	}
+
+	authenticateWithBrowserFn = func(config Config) (string, error) {
+		t.Fatal("authenticateWithBrowser() should not be called when reattaching")
+		return "", nil
+	}
+
+	var output bytes.Buffer
+	if err := run(nil, strings.NewReader(""), &output); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if output.String() != "attached\n" {
+		t.Fatalf("output = %q, want attached\\n", output.String())
+	}
+}
+
+func TestRunBackgroundModeUsesManagedSession(t *testing.T) {
+	restore := stubMainDependencies()
+	defer restore()
+
+	loadConfigFileFn = func(path string, stdin io.Reader, stdout io.Writer) (Config, error) {
+		return Config{
+			Region:          "eu-west-1",
+			RefreshInterval: 3500,
+			Credentials:     CredentialsConfig{DefaultProfile: "prod"},
+			Accounts:        []Account{{Label: "prod"}},
+		}, nil
+	}
+
+	managedSessionCalled := false
+	runManagedBackgroundSessionFn = func(stdin io.Reader, stdout io.Writer, configPath string, config *Config) error {
+		managedSessionCalled = true
+		return nil
+	}
+
+	reattachBackgroundSessionFn = func(stdout io.Writer) (bool, error) {
+		t.Fatal("reattachBackgroundSession() should not be called in --background-run mode")
+		return false, nil
+	}
+
+	if err := run([]string{"--background-run"}, strings.NewReader(""), &bytes.Buffer{}); err != nil {
+		t.Fatalf("run() error = %v", err)
+	}
+	if !managedSessionCalled {
+		t.Fatal("runManagedBackgroundSession() was not called")
+	}
+}
+
 func stubMainDependencies() func() {
 	originalLoadConfigFileFn := loadConfigFileFn
 	originalWriteConfigFileFn := writeConfigFileFn
@@ -288,6 +352,8 @@ func stubMainDependencies() func() {
 	originalAssumeRolesFn := assumeRolesFn
 	originalWriteRolesToAWSCredentialsFileFn := writeRolesToAWSCredentialsFileFn
 	originalStartBackgroundProcessFn := startBackgroundProcessFn
+	originalReattachBackgroundSessionFn := reattachBackgroundSessionFn
+	originalRunManagedBackgroundSessionFn := runManagedBackgroundSessionFn
 	originalSignSelectedTenantURLFn := signSelectedTenantURLFn
 	originalBuildIAMAuthTokenFn := buildIAMAuthTokenFn
 
@@ -299,6 +365,8 @@ func stubMainDependencies() func() {
 		assumeRolesFn = originalAssumeRolesFn
 		writeRolesToAWSCredentialsFileFn = originalWriteRolesToAWSCredentialsFileFn
 		startBackgroundProcessFn = originalStartBackgroundProcessFn
+		reattachBackgroundSessionFn = originalReattachBackgroundSessionFn
+		runManagedBackgroundSessionFn = originalRunManagedBackgroundSessionFn
 		signSelectedTenantURLFn = originalSignSelectedTenantURLFn
 		buildIAMAuthTokenFn = originalBuildIAMAuthTokenFn
 	}

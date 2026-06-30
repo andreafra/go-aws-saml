@@ -78,6 +78,8 @@ In the interactive tenant selector:
 - `q` quits
 - `d` starts the refresh loop in the background and returns control to the shell
 
+If a background refresh loop is already running, starting `go-aws-saml` again reattaches to that existing loop instead of launching a second one. Press `Ctrl+C` to detach from the attached view while leaving the background refresh loop running.
+
 You can also generate a signed URL directly:
 
 ```bash
