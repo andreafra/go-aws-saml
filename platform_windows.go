@@ -72,7 +72,10 @@ func enableRawTerminal(stdin io.Reader) (func(), error) {
 
 	rawMode := rawConsoleMode(mode)
 	if err := windows.SetConsoleMode(handle, rawMode); err != nil {
-		return nil, fmt.Errorf("set terminal raw mode: %w", err)
+		fallbackMode := rawMode &^ windows.ENABLE_VIRTUAL_TERMINAL_INPUT
+		if fallbackMode == rawMode || windows.SetConsoleMode(handle, fallbackMode) != nil {
+			return nil, fmt.Errorf("set terminal raw mode: %w", err)
+		}
 	}
 
 	return func() {
