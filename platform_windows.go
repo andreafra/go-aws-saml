@@ -47,7 +47,7 @@ func processRunning(pid int) (bool, error) {
 }
 
 func backgroundDetachSignals() []os.Signal {
-	return []os.Signal{os.Interrupt}
+	return []os.Signal{os.Interrupt, syscall.SIGTERM}
 }
 
 func enableRawTerminal(stdin io.Reader) (func(), error) {
