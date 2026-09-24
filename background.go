@@ -1,10 +1,8 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
-	"syscall"
 )
 
 func startBackgroundProcess() error {
@@ -31,15 +29,13 @@ func startBackgroundProcess() error {
 		Dir:   "",
 		Env:   os.Environ(),
 		Files: []*os.File{devNull, devNull, devNull},
-		Sys: &syscall.SysProcAttr{
-			Setsid: true,
-		},
+		Sys:   backgroundSysProcAttr(),
 	})
 	if err != nil {
 		return fmt.Errorf("start background refresh process: %w", err)
 	}
 
-	if err := process.Release(); err != nil && !errors.Is(err, syscall.EINVAL) {
+	if err := releaseBackgroundProcess(process); err != nil {
 		return fmt.Errorf("release background refresh process: %w", err)
 	}
 

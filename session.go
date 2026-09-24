@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -148,20 +147,6 @@ func loadBackgroundSession() (*backgroundSession, error) {
 	return nil, nil
 }
 
-func processRunning(pid int) (bool, error) {
-	err := syscall.Kill(pid, 0)
-	if err == nil {
-		return true, nil
-	}
-	if errors.Is(err, syscall.ESRCH) {
-		return false, nil
-	}
-	if errors.Is(err, syscall.EPERM) {
-		return true, nil
-	}
-	return false, fmt.Errorf("check background session pid %d: %w", pid, err)
-}
-
 func attachToBackgroundSession(stdout io.Writer, session backgroundSession) error {
 	logFile, err := os.OpenFile(session.LogPath, os.O_CREATE|os.O_RDONLY, 0600)
 	if err != nil {
@@ -178,7 +163,11 @@ func attachToBackgroundSession(stdout io.Writer, session backgroundSession) erro
 	}
 
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	detachSignals := backgroundDetachSignals()
+	if len(detachSignals) == 0 {
+		detachSignals = []os.Signal{os.Interrupt}
+	}
+	signal.Notify(signals, detachSignals...)
 	defer signal.Stop(signals)
 
 	for {
