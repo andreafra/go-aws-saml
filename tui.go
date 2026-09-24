@@ -4,10 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
-	"os"
 	"strings"
-
-	"golang.org/x/sys/unix"
 )
 
 type defaultProfileSelectionResult struct {
@@ -364,41 +361,4 @@ func readMenuKey(reader *bufio.Reader) (menuKey, error) {
 			}
 		}
 	}
-}
-
-func enableRawTerminal(stdin io.Reader) (func(), error) {
-	file, ok := stdin.(*os.File)
-	if !ok {
-		return nil, nil
-	}
-
-	info, err := file.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("stat terminal: %w", err)
-	}
-	if info.Mode()&os.ModeCharDevice == 0 {
-		return nil, nil
-	}
-
-	fd := int(file.Fd())
-	state, err := unix.IoctlGetTermios(fd, unix.TCGETS)
-	if err != nil {
-		return nil, fmt.Errorf("read terminal settings: %w", err)
-	}
-
-	rawState := *state
-	rawState.Iflag &^= unix.IGNBRK | unix.BRKINT | unix.PARMRK | unix.ISTRIP | unix.INLCR | unix.IGNCR | unix.ICRNL | unix.IXON
-	rawState.Lflag &^= unix.ECHO | unix.ECHONL | unix.ICANON | unix.ISIG | unix.IEXTEN
-	rawState.Cflag &^= unix.CSIZE | unix.PARENB
-	rawState.Cflag |= unix.CS8
-	rawState.Cc[unix.VMIN] = 1
-	rawState.Cc[unix.VTIME] = 0
-
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &rawState); err != nil {
-		return nil, fmt.Errorf("set terminal raw mode: %w", err)
-	}
-
-	return func() {
-		_ = unix.IoctlSetTermios(fd, unix.TCSETS, state)
-	}, nil
 }

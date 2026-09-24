@@ -2,9 +2,36 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"strings"
 	"testing"
 )
+
+func TestEnableRawTerminalIgnoresNonFileInput(t *testing.T) {
+	restore, err := enableRawTerminal(strings.NewReader("input"))
+	if err != nil {
+		t.Fatalf("enableRawTerminal() error = %v", err)
+	}
+	if restore != nil {
+		t.Fatal("enableRawTerminal() restore != nil, want nil")
+	}
+}
+
+func TestEnableRawTerminalIgnoresRegularFiles(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "stdin")
+	if err != nil {
+		t.Fatalf("CreateTemp() error = %v", err)
+	}
+	defer file.Close()
+
+	restore, err := enableRawTerminal(file)
+	if err != nil {
+		t.Fatalf("enableRawTerminal() error = %v", err)
+	}
+	if restore != nil {
+		t.Fatal("enableRawTerminal() restore != nil, want nil")
+	}
+}
 
 func TestSelectDefaultProfileUpdatesConfigWithArrowDownAndEnter(t *testing.T) {
 	config := Config{
