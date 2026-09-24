@@ -21,6 +21,10 @@ func releaseBackgroundProcess(process *os.Process) error {
 }
 
 func processRunning(pid int) (bool, error) {
+	if pid <= 0 {
+		return false, nil
+	}
+
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err == nil {
 		_ = windows.CloseHandle(handle)
@@ -53,5 +57,24 @@ func enableRawTerminal(stdin io.Reader) (func(), error) {
 		return nil, nil
 	}
 
-	return nil, nil
+	handle := windows.Handle(file.Fd())
+	var mode uint32
+	if err := windows.GetConsoleMode(handle, &mode); err != nil {
+		return nil, fmt.Errorf("read terminal settings: %w", err)
+	}
+
+	rawMode := rawConsoleMode(mode)
+	if err := windows.SetConsoleMode(handle, rawMode); err != nil {
+		return nil, fmt.Errorf("set terminal raw mode: %w", err)
+	}
+
+	return func() {
+		_ = windows.SetConsoleMode(handle, mode)
+	}, nil
+}
+
+func rawConsoleMode(mode uint32) uint32 {
+	mode &^= windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT
+	mode |= windows.ENABLE_VIRTUAL_TERMINAL_INPUT
+	return mode
 }
