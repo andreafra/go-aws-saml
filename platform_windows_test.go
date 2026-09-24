@@ -13,11 +13,8 @@ func TestRawConsoleModeEnablesRawFlags(t *testing.T) {
 
 	raw := rawConsoleMode(mode)
 
-	if raw&(windows.ENABLE_ECHO_INPUT|windows.ENABLE_LINE_INPUT) != 0 {
-		t.Fatalf("raw = %#x, want line-editing console flags cleared", raw)
-	}
-	if raw&windows.ENABLE_PROCESSED_INPUT == 0 {
-		t.Fatalf("raw = %#x, want ENABLE_PROCESSED_INPUT preserved", raw)
+	if raw&(windows.ENABLE_ECHO_INPUT|windows.ENABLE_LINE_INPUT|windows.ENABLE_PROCESSED_INPUT) != 0 {
+		t.Fatalf("raw = %#x, want cooked console flags cleared", raw)
 	}
 	if raw&windows.ENABLE_VIRTUAL_TERMINAL_INPUT == 0 {
 		t.Fatalf("raw = %#x, want ENABLE_VIRTUAL_TERMINAL_INPUT set", raw)

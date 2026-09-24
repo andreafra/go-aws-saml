@@ -81,7 +81,7 @@ func enableRawTerminal(stdin io.Reader) (func(), error) {
 }
 
 func rawConsoleMode(mode uint32) uint32 {
-	mode &^= windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT
+	mode &^= windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT
 	mode |= windows.ENABLE_VIRTUAL_TERMINAL_INPUT
 	return mode
 }
