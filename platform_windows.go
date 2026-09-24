@@ -12,6 +12,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+const windowsStillActive = 259
+
 func backgroundSysProcAttr() *syscall.SysProcAttr {
 	return &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
 }
@@ -27,8 +29,13 @@ func processRunning(pid int) (bool, error) {
 
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err == nil {
-		_ = windows.CloseHandle(handle)
-		return true, nil
+		defer windows.CloseHandle(handle)
+
+		var exitCode uint32
+		if err := windows.GetExitCodeProcess(handle, &exitCode); err != nil {
+			return false, fmt.Errorf("check background session pid %d exit code: %w", pid, err)
+		}
+		return exitCode == windowsStillActive, nil
 	}
 	if errors.Is(err, windows.ERROR_INVALID_PARAMETER) {
 		return false, nil
@@ -74,7 +81,7 @@ func enableRawTerminal(stdin io.Reader) (func(), error) {
 }
 
 func rawConsoleMode(mode uint32) uint32 {
-	mode &^= windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT | windows.ENABLE_PROCESSED_INPUT
+	mode &^= windows.ENABLE_ECHO_INPUT | windows.ENABLE_LINE_INPUT
 	mode |= windows.ENABLE_VIRTUAL_TERMINAL_INPUT
 	return mode
 }
