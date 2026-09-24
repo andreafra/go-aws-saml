@@ -163,7 +163,11 @@ func attachToBackgroundSession(stdout io.Writer, session backgroundSession) erro
 	}
 
 	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, backgroundDetachSignals()...)
+	detachSignals := backgroundDetachSignals()
+	if len(detachSignals) == 0 {
+		detachSignals = []os.Signal{os.Interrupt}
+	}
+	signal.Notify(signals, detachSignals...)
 	defer signal.Stop(signals)
 
 	for {
