@@ -176,6 +176,24 @@ func TestBrowserHeadlessEnabledHonorsExplicitFalse(t *testing.T) {
 	}
 }
 
+func TestManualLoginConfigRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yml")
+	want := Config{Browser: BrowserConfig{ManualLogin: true, Headless: boolPtr(true)}}
+	if err := writeConfigFile(path, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readConfigFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Browser.ManualLogin {
+		t.Fatal("manual-login was not preserved")
+	}
+	if got.Browser.headlessEnabled() {
+		t.Fatal("manual login must open a visible browser even when headless is true")
+	}
+}
+
 func validRuntimeConfig() Config {
 	return Config{
 		Region:      "eu-west-1",
