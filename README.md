@@ -37,6 +37,7 @@ browser:
   starting-url: <the starting url that sends you to login>
   executable-path: "" # optional; path to the browser binary, useful on WSL
   headless: true # optional; set to false to display the browser window
+  manual-login: false # optional; log in manually instead of using configured credentials
   debug: false # optional; set to true to enable debug logs
   login:
     wait-for-selector: <the selector that waits for the login page to load>
@@ -61,6 +62,18 @@ iam-auth-token-requests:
 
 The account whose label matches `credentials.default` is also written to the
 `[default]` profile in `~/.aws/credentials`.
+
+To log in manually, set `browser.manual-login: true`. The program opens a
+visible browser and waits up to 120 seconds from browser startup for the SAML
+response. Username, password, TOTP secret, and login/TOTP selectors are not
+needed in this mode. The browser closes after authentication. In manual mode
+it uses a dedicated persistent profile in the
+user configuration directory (`%AppData%\go-aws-saml\browser-profile` on
+Windows) instead of your normal browser profile. A session can be reused on
+later refreshes if the identity provider and browser retain it; otherwise,
+you must log in again. This profile contains sensitive browser data. Each
+refresh, including in the background, opens the browser; if authentication
+is not completed in time, the refresh loop stops.
 
 To change the default profile from the configured accounts:
 

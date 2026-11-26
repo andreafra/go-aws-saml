@@ -42,6 +42,7 @@ type BrowserConfig struct {
 	StartingURL    string      `yaml:"starting-url"`
 	ExecutablePath string      `yaml:"executable-path,omitempty"`
 	Headless       *bool       `yaml:"headless,omitempty"`
+	ManualLogin    bool        `yaml:"manual-login,omitempty"`
 	Debug          bool        `yaml:"debug,omitempty"`
 	Login          LoginConfig `yaml:"login"`
 	TOTP           TOTPConfig  `yaml:"totp"`
@@ -218,7 +219,7 @@ func resolveEditor() (string, error) {
 }
 
 func (c BrowserConfig) headlessEnabled() bool {
-	return c.Headless == nil || *c.Headless
+	return !c.ManualLogin && (c.Headless == nil || *c.Headless)
 }
 
 func boolPtr(value bool) *bool {

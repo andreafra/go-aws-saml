@@ -4,7 +4,10 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -15,17 +18,20 @@ import (
 
 const (
 	awsLoginSAMLPageURL = "https://signin.aws.amazon.com/saml"
-	browserTimeout      = 30 * time.Second
+	browserTimeout      = 120 * time.Second
+	browserCloseTimeout = 10 * time.Second
 )
 
 func authenticateWithBrowser(config Config) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), browserTimeout)
 	defer cancel()
 
-	totp := gotp.NewDefaultTOTP(config.Credentials.TOTP)
 	samlResponseChan := make(chan string, 1)
 	samlErrorChan := make(chan error, 1)
-	opts := browserAllocatorOptions(config)
+	opts, err := browserAllocatorOptions(config)
+	if err != nil {
+		return "", err
+	}
 	headless := config.Browser.headlessEnabled()
 
 	allocCtx, allocCancel := chromedp.NewExecAllocator(ctx, opts...)
@@ -53,47 +59,83 @@ func authenticateWithBrowser(config Config) (string, error) {
 		sendSAMLResponse(samlResponseChan, samlResponse)
 	})
 
-	actionCtx, actionCancel := context.WithTimeout(chromedpCtx, browserTimeout)
-	defer actionCancel()
-
-	totpWaitSelector := fallbackSelector(config.Browser.TOTP.WaitForSelector, config.Browser.TOTP.TOTPSelector)
-	debugLog(config, "Using login wait selector %q", config.Browser.Login.WaitForSelector)
-	debugLog(config, "Using TOTP wait selector %q", totpWaitSelector)
 	debugLog(config, "Navigating to %s", config.Browser.StartingURL)
 
-	if err := chromedp.Run(actionCtx,
-		chromedp.Navigate(config.Browser.StartingURL),
-		chromedp.WaitVisible(config.Browser.Login.WaitForSelector),
-		chromedp.SendKeys(config.Browser.Login.UsernameSelector, config.Credentials.Username),
-		chromedp.SendKeys(config.Browser.Login.PasswordSelector, config.Credentials.Password),
-		chromedp.Click(config.Browser.Login.SubmitSelector),
-		chromedp.WaitVisible(totpWaitSelector),
-		chromedp.SendKeys(config.Browser.TOTP.TOTPSelector, totp.Now()),
-		chromedp.Click(config.Browser.TOTP.SubmitSelector),
-	); err != nil {
-		return "", fmt.Errorf("authenticate in browser: %w", err)
+	actions := []chromedp.Action{chromedp.Navigate(config.Browser.StartingURL)}
+	if config.Browser.ManualLogin {
+		log.Printf("Complete the login in the browser within %v", browserTimeout)
+		backgroundSessionLogf("Complete the login in the browser within %v", browserTimeout)
+	} else {
+		totp := gotp.NewDefaultTOTP(config.Credentials.TOTP)
+		totpWaitSelector := fallbackSelector(config.Browser.TOTP.WaitForSelector, config.Browser.TOTP.TOTPSelector)
+		debugLog(config, "Using login wait selector %q", config.Browser.Login.WaitForSelector)
+		debugLog(config, "Using TOTP wait selector %q", totpWaitSelector)
+		actions = append(actions,
+			chromedp.WaitVisible(config.Browser.Login.WaitForSelector),
+			chromedp.SendKeys(config.Browser.Login.UsernameSelector, config.Credentials.Username),
+			chromedp.SendKeys(config.Browser.Login.PasswordSelector, config.Credentials.Password),
+			chromedp.Click(config.Browser.Login.SubmitSelector),
+			chromedp.WaitVisible(totpWaitSelector),
+			chromedp.SendKeys(config.Browser.TOTP.TOTPSelector, totp.Now()),
+			chromedp.Click(config.Browser.TOTP.SubmitSelector),
+		)
+	}
+	if err := runBrowserActions(chromedpCtx, actions...); err != nil {
+		return "", err
 	}
 
-	debugLog(config, "Submitted login and TOTP forms, waiting for SAML response")
+	debugLog(config, "Waiting for SAML response")
 
+	samlResponse, err := waitForSAMLResponse(ctx, samlResponseChan, samlErrorChan, config.Browser.ManualLogin)
+	if err != nil {
+		return "", err
+	}
+	debugLog(config, "Closing browser contexts after SAML capture")
+	if config.Browser.ManualLogin {
+		if err := closeBrowser(chromedpCtx); err != nil {
+			return "", err
+		}
+	}
+	runtimeDebugLogln("Login successful")
+	return samlResponse, nil
+}
+
+func runBrowserActions(ctx context.Context, actions ...chromedp.Action) error {
+	if err := chromedp.Run(ctx, actions...); err != nil {
+		return fmt.Errorf("authenticate in browser: %w", err)
+	}
+	return nil
+}
+
+func closeBrowser(ctx context.Context) error {
+	closeCtx, cancel := context.WithTimeout(ctx, browserCloseTimeout)
+	defer cancel()
+	if err := chromedp.Cancel(closeCtx); err != nil {
+		return fmt.Errorf("close browser: %w", err)
+	}
+	return nil
+}
+
+func waitForSAMLResponse(ctx context.Context, responseChan <-chan string, errorChan <-chan error, manualLogin bool) (string, error) {
+	var timeout <-chan time.Time
+	if !manualLogin {
+		timer := time.NewTimer(5 * time.Second)
+		defer timer.Stop()
+		timeout = timer.C
+	}
 	select {
-	case samlResponse := <-samlResponseChan:
-		debugLog(config, "Closing browser contexts after SAML capture")
-		actionCancel()
-		browserCancel()
-		allocCancel()
-		runtimeDebugLogln("Login successful")
+	case samlResponse := <-responseChan:
 		return samlResponse, nil
-	case err := <-samlErrorChan:
+	case err := <-errorChan:
 		return "", err
 	case <-ctx.Done():
 		return "", fmt.Errorf("wait for SAML response: %w", ctx.Err())
-	case <-time.After(5 * time.Second):
+	case <-timeout:
 		return "", fmt.Errorf("timed out waiting for SAML response")
 	}
 }
 
-func browserAllocatorOptions(config Config) []chromedp.ExecAllocatorOption {
+func browserAllocatorOptions(config Config) ([]chromedp.ExecAllocatorOption, error) {
 	opts := append(
 		chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", config.Browser.headlessEnabled()),
@@ -101,8 +143,19 @@ func browserAllocatorOptions(config Config) []chromedp.ExecAllocatorOption {
 	if config.Browser.ExecutablePath != "" {
 		opts = append(opts, chromedp.ExecPath(config.Browser.ExecutablePath))
 	}
+	if config.Browser.ManualLogin {
+		configDir, err := os.UserConfigDir()
+		if err != nil {
+			return nil, fmt.Errorf("resolve browser profile directory: %w", err)
+		}
+		profileDir := filepath.Join(configDir, "go-aws-saml", "browser-profile")
+		if err := os.MkdirAll(profileDir, 0700); err != nil {
+			return nil, fmt.Errorf("create browser profile directory %q: %w", profileDir, err)
+		}
+		opts = append(opts, chromedp.UserDataDir(profileDir))
+	}
 
-	return opts
+	return opts, nil
 }
 
 func debugLog(config Config, format string, args ...any) {
